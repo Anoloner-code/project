@@ -1,1 +1,1 @@
-print("Hello World\n")
+print("suck dick\n")
