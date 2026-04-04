@@ -2,10 +2,10 @@
 
 int main() {
 
-    float sunnydicksize = 0.01f;
-    while (sunnydicksize < 1.0f) {
+    float sunnydicksize = 100.0f;
+    while (sunnydicksize < 1000.0f) {
     printf("Hello sunny's %.2f inch dick\n", sunnydicksize);
-    sunnydicksize+= 0.01;
+    sunnydicksize+= 1;
     }
      printf(
 "⠀⠀⠀⠀⠀⠀⠀⣠⣤⣤⣤⣤⣤⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
