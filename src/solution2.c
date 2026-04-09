@@ -1,7 +1,9 @@
+#include <limits.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 
 #include "helpers.h"
 
@@ -19,8 +21,19 @@ typedef enum {
 } OpType;
 
 typedef struct {
+    char name[ITEM_NAME_MAX + 1];
+    unsigned int size_bytes;
+} DirectoryEntry;
+
+typedef struct {
+    DirectoryEntry *data;
+    int size;
+    int cap;
+} DirectoryRegistry;
+
+typedef struct {
     OpType op;
-    char item[ITEM_NAME_MAX + 1];
+    int entry_index;
 } Operation;
 
 typedef struct {
@@ -30,20 +43,14 @@ typedef struct {
 } OpList;
 
 typedef struct {
-    char name[ITEM_NAME_MAX + 1];
     int active_readers;
-    int active_writer;
+    int writer_active;
+    int waiting_managers;
     int waiting_supervisors;
+    unsigned long read_overlap_epoch;
     pthread_mutex_t mtx;
     pthread_cond_t cv;
-} ItemState;
-
-typedef struct {
-    ItemState *data;
-    int size;
-    int cap;
-    pthread_mutex_t mtx;
-} ItemRegistry;
+} DirectoryState;
 
 typedef struct {
     Role role;
@@ -60,7 +67,8 @@ static OpList *g_worker_ops = NULL;
 static OpList *g_manager_ops = NULL;
 static OpList *g_supervisor_ops = NULL;
 
-static ItemRegistry g_registry;
+static DirectoryRegistry g_registry;
+static DirectoryState g_directory;
 static pthread_mutex_t g_print_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void die(const char *msg) {
@@ -68,15 +76,28 @@ static void die(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
-static void *xmalloc(size_t n) {
-    if (n == 0) {
+static void *xmalloc(size_t size) {
+    if (size == 0) {
         return NULL;
     }
-    void *p = malloc(n);
-    if (p == NULL) {
+
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
         die("malloc failed");
     }
-    return p;
+    return ptr;
+}
+
+static void print_line(const char *fmt, ...) {
+    va_list args;
+
+    pthread_mutex_lock(&g_print_mtx);
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    putchar('\n');
+    fflush(stdout);
+    pthread_mutex_unlock(&g_print_mtx);
 }
 
 static void op_list_init(OpList *list) {
@@ -95,6 +116,7 @@ static void op_list_push(OpList *list, const Operation *op) {
         list->data = new_data;
         list->cap = new_cap;
     }
+
     list->data[list->size++] = *op;
 }
 
@@ -105,185 +127,84 @@ static void op_list_destroy(OpList *list) {
     list->cap = 0;
 }
 
-static void registry_init(ItemRegistry *r) {
-    r->data = NULL;
-    r->size = 0;
-    r->cap = 0;
-    if (pthread_mutex_init(&r->mtx, NULL) != 0) {
-        die("pthread_mutex_init failed");
-    }
+static void registry_init(DirectoryRegistry *registry) {
+    registry->data = NULL;
+    registry->size = 0;
+    registry->cap = 0;
 }
 
-static void registry_destroy(ItemRegistry *r) {
-    for (int i = 0; i < r->size; i++) {
-        pthread_mutex_destroy(&r->data[i].mtx);
-        pthread_cond_destroy(&r->data[i].cv);
-    }
-    free(r->data);
-    pthread_mutex_destroy(&r->mtx);
+static void registry_destroy(DirectoryRegistry *registry) {
+    free(registry->data);
+    registry->data = NULL;
+    registry->size = 0;
+    registry->cap = 0;
 }
 
-static ItemState *registry_get_or_create(ItemRegistry *r, const char *item) {
-    if (pthread_mutex_lock(&r->mtx) != 0) {
-        die("pthread_mutex_lock failed");
-    }
+static int parse_item_number(const char *item_name) {
+    int value = 0;
+    int found_digit = 0;
 
-    for (int i = 0; i < r->size; i++) {
-        if (strcmp(r->data[i].name, item) == 0) {
-            ItemState *found = &r->data[i];
-            pthread_mutex_unlock(&r->mtx);
-            return found;
+    for (const char *p = item_name; *p != '\0'; p++) {
+        if (*p >= '0' && *p <= '9') {
+            found_digit = 1;
+            value = value * 10 + (*p - '0');
         }
     }
 
-    if (r->size == r->cap) {
-        int new_cap = (r->cap == 0) ? 16 : r->cap * 2;
-        ItemState *new_data = realloc(r->data, (size_t)new_cap * sizeof(ItemState));
+    return found_digit ? value : 0;
+}
+
+static unsigned int initial_size_for_item(const char *item_name) {
+    int item_number = parse_item_number(item_name);
+    unsigned int multiplier = 1u << (item_number % 4);
+    return 512u * multiplier;
+}
+
+static int registry_get_or_add(DirectoryRegistry *registry, const char *item_name) {
+    for (int i = 0; i < registry->size; i++) {
+        if (strcmp(registry->data[i].name, item_name) == 0) {
+            return i;
+        }
+    }
+
+    if (registry->size == registry->cap) {
+        int new_cap = (registry->cap == 0) ? 16 : registry->cap * 2;
+        DirectoryEntry *new_data = realloc(registry->data, (size_t)new_cap * sizeof(DirectoryEntry));
         if (new_data == NULL) {
-            pthread_mutex_unlock(&r->mtx);
             die("realloc failed");
         }
-        r->data = new_data;
-        r->cap = new_cap;
+        registry->data = new_data;
+        registry->cap = new_cap;
     }
 
-    ItemState *st = &r->data[r->size++];
-    memset(st, 0, sizeof(*st));
-    strncpy(st->name, item, ITEM_NAME_MAX);
-    st->name[ITEM_NAME_MAX] = '\0';
-    if (pthread_mutex_init(&st->mtx, NULL) != 0) {
-        pthread_mutex_unlock(&r->mtx);
+    DirectoryEntry *entry = &registry->data[registry->size];
+    strncpy(entry->name, item_name, ITEM_NAME_MAX);
+    entry->name[ITEM_NAME_MAX] = '\0';
+    entry->size_bytes = initial_size_for_item(item_name);
+    registry->size++;
+    return registry->size - 1;
+}
+
+static DirectoryEntry *registry_get_entry(DirectoryRegistry *registry, int entry_index) {
+    if (entry_index < 0 || entry_index >= registry->size) {
+        die("invalid directory entry index");
+    }
+    return &registry->data[entry_index];
+}
+
+static void directory_state_init(DirectoryState *state) {
+    memset(state, 0, sizeof(*state));
+    if (pthread_mutex_init(&state->mtx, NULL) != 0) {
         die("pthread_mutex_init failed");
     }
-    if (pthread_cond_init(&st->cv, NULL) != 0) {
-        pthread_mutex_unlock(&r->mtx);
+    if (pthread_cond_init(&state->cv, NULL) != 0) {
         die("pthread_cond_init failed");
     }
-
-    pthread_mutex_unlock(&r->mtx);
-    return st;
 }
 
-static ItemState *registry_get(ItemRegistry *r, const char *item) {
-    if (pthread_mutex_lock(&r->mtx) != 0) {
-        die("pthread_mutex_lock failed");
-    }
-
-    for (int i = 0; i < r->size; i++) {
-        if (strcmp(r->data[i].name, item) == 0) {
-            ItemState *found = &r->data[i];
-            pthread_mutex_unlock(&r->mtx);
-            return found;
-        }
-    }
-
-    pthread_mutex_unlock(&r->mtx);
-    die("item not found in registry");
-    return NULL;
-}
-
-static const char *role_name(Role role) {
-    switch (role) {
-        case ROLE_WORKER:
-            return "Worker";
-        case ROLE_MANAGER:
-            return "Manager";
-        case ROLE_SUPERVISOR:
-            return "Supervisor";
-        default:
-            return "Unknown";
-    }
-}
-
-static void print_done(Role role, int id, const char *op_name, const char *item) {
-    pthread_mutex_lock(&g_print_mtx);
-    printf("[%s-%d] %s %s\n", role_name(role), id, op_name, item);
-    fflush(stdout);
-    pthread_mutex_unlock(&g_print_mtx);
-}
-
-static void perform_worker_read(int id, ItemState *st, const char *item) {
-    pthread_mutex_lock(&st->mtx);
-    while (st->active_writer || st->waiting_supervisors > 0) {
-        pthread_cond_wait(&st->cv, &st->mtx);
-    }
-    st->active_readers++;
-    pthread_mutex_unlock(&st->mtx);
-
-    simulate_work(OP_Q2_WORKER_READ);
-
-    pthread_mutex_lock(&st->mtx);
-    st->active_readers--;
-    if (st->active_readers == 0) {
-        pthread_cond_broadcast(&st->cv);
-    }
-    pthread_mutex_unlock(&st->mtx);
-
-    print_done(ROLE_WORKER, id, "READ", item);
-}
-
-static void perform_manager_write(int id, ItemState *st, const char *item) {
-    pthread_mutex_lock(&st->mtx);
-    while (st->active_writer || st->active_readers > 0) {
-        pthread_cond_wait(&st->cv, &st->mtx);
-    }
-    st->active_writer = 1;
-    pthread_mutex_unlock(&st->mtx);
-
-    simulate_work(OP_Q2_MANAGER_HANDLE);
-
-    pthread_mutex_lock(&st->mtx);
-    st->active_writer = 0;
-    pthread_cond_broadcast(&st->cv);
-    pthread_mutex_unlock(&st->mtx);
-
-    print_done(ROLE_MANAGER, id, "WRITE", item);
-}
-
-static void perform_supervisor_write(int id, ItemState *st, const char *item) {
-    pthread_mutex_lock(&st->mtx);
-    st->waiting_supervisors++;
-    while (st->active_writer || st->active_readers > 0) {
-        pthread_cond_wait(&st->cv, &st->mtx);
-    }
-    st->waiting_supervisors--;
-    st->active_writer = 1;
-    pthread_mutex_unlock(&st->mtx);
-
-    simulate_work(OP_Q2_SUPERVISOR_UPDATE);
-
-    pthread_mutex_lock(&st->mtx);
-    st->active_writer = 0;
-    pthread_cond_broadcast(&st->cv);
-    pthread_mutex_unlock(&st->mtx);
-
-    print_done(ROLE_SUPERVISOR, id, "WRITE", item);
-}
-
-static void *role_thread_main(void *arg) {
-    ThreadCtx *ctx = (ThreadCtx *)arg;
-    for (int i = 0; i < ctx->ops->size; i++) {
-        Operation *op = &ctx->ops->data[i];
-        ItemState *st = registry_get(&g_registry, op->item);
-
-        if (ctx->role == ROLE_WORKER) {
-            if (op->op != OP_READ) {
-                die("Worker has non-READ operation");
-            }
-            perform_worker_read(ctx->id, st, op->item);
-        } else if (ctx->role == ROLE_MANAGER) {
-            if (op->op != OP_WRITE) {
-                die("Manager has non-WRITE operation");
-            }
-            perform_manager_write(ctx->id, st, op->item);
-        } else {
-            if (op->op != OP_WRITE) {
-                die("Supervisor has non-WRITE operation");
-            }
-            perform_supervisor_write(ctx->id, st, op->item);
-        }
-    }
-    return NULL;
+static void directory_state_destroy(DirectoryState *state) {
+    pthread_mutex_destroy(&state->mtx);
+    pthread_cond_destroy(&state->cv);
 }
 
 static void init_role_op_arrays(void) {
@@ -291,18 +212,34 @@ static void init_role_op_arrays(void) {
     g_manager_ops = xmalloc((size_t)g_num_managers * sizeof(OpList));
     g_supervisor_ops = xmalloc((size_t)g_num_supervisors * sizeof(OpList));
 
-    for (int i = 0; i < g_num_workers; i++) op_list_init(&g_worker_ops[i]);
-    for (int i = 0; i < g_num_managers; i++) op_list_init(&g_manager_ops[i]);
-    for (int i = 0; i < g_num_supervisors; i++) op_list_init(&g_supervisor_ops[i]);
+    for (int i = 0; i < g_num_workers; i++) {
+        op_list_init(&g_worker_ops[i]);
+    }
+    for (int i = 0; i < g_num_managers; i++) {
+        op_list_init(&g_manager_ops[i]);
+    }
+    for (int i = 0; i < g_num_supervisors; i++) {
+        op_list_init(&g_supervisor_ops[i]);
+    }
 }
 
 static void destroy_role_op_arrays(void) {
-    for (int i = 0; i < g_num_workers; i++) op_list_destroy(&g_worker_ops[i]);
-    for (int i = 0; i < g_num_managers; i++) op_list_destroy(&g_manager_ops[i]);
-    for (int i = 0; i < g_num_supervisors; i++) op_list_destroy(&g_supervisor_ops[i]);
+    for (int i = 0; i < g_num_workers; i++) {
+        op_list_destroy(&g_worker_ops[i]);
+    }
+    for (int i = 0; i < g_num_managers; i++) {
+        op_list_destroy(&g_manager_ops[i]);
+    }
+    for (int i = 0; i < g_num_supervisors; i++) {
+        op_list_destroy(&g_supervisor_ops[i]);
+    }
+
     free(g_worker_ops);
     free(g_manager_ops);
     free(g_supervisor_ops);
+    g_worker_ops = NULL;
+    g_manager_ops = NULL;
+    g_supervisor_ops = NULL;
 }
 
 static void parse_input(const char *path) {
@@ -321,16 +258,17 @@ static void parse_input(const char *path) {
         die("negative values in config");
     }
 
+    registry_init(&g_registry);
     init_role_op_arrays();
 
     for (int i = 0; i < g_num_ops; i++) {
         char role_ch = '\0';
         int id = -1;
         char op_str[16];
-        char item[ITEM_NAME_MAX + 1];
+        char item_name[ITEM_NAME_MAX + 1];
         Operation op;
 
-        if (fscanf(fp, " %c %d %15s %127s", &role_ch, &id, op_str, item) != 4) {
+        if (fscanf(fp, " %c %d %15s %127s", &role_ch, &id, op_str, item_name) != 4) {
             fclose(fp);
             die("invalid operation line");
         }
@@ -344,8 +282,7 @@ static void parse_input(const char *path) {
             die("unknown operation type");
         }
 
-        strncpy(op.item, item, ITEM_NAME_MAX);
-        op.item[ITEM_NAME_MAX] = '\0';
+        op.entry_index = registry_get_or_add(&g_registry, item_name);
 
         if (role_ch == 'W') {
             if (id < 0 || id >= g_num_workers) {
@@ -386,24 +323,136 @@ static void parse_input(const char *path) {
     fclose(fp);
 }
 
-static void preregister_items(void) {
-    for (int i = 0; i < g_num_workers; i++) {
-        for (int j = 0; j < g_worker_ops[i].size; j++) {
-            registry_get_or_create(&g_registry, g_worker_ops[i].data[j].item);
+static void perform_worker_read(int worker_id, DirectoryEntry *entry) {
+    int waiting_message_printed = 0;
+    unsigned long start_overlap_epoch;
+    int concurrent_read = 0;
+    unsigned int observed_size;
+
+    pthread_mutex_lock(&g_directory.mtx);
+    while (g_directory.writer_active || g_directory.waiting_supervisors > 0 || g_directory.waiting_managers > 0) {
+        if (!waiting_message_printed && g_directory.waiting_supervisors > 0) {
+            print_line("[Worker-%d] [worker blocked: supervisor pending] waiting...", worker_id);
+            waiting_message_printed = 1;
+        }
+        pthread_cond_wait(&g_directory.cv, &g_directory.mtx);
+    }
+
+    start_overlap_epoch = g_directory.read_overlap_epoch;
+    if (g_directory.active_readers > 0) {
+        g_directory.read_overlap_epoch++;
+        concurrent_read = 1;
+    }
+    g_directory.active_readers++;
+    observed_size = entry->size_bytes;
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    simulate_work(OP_Q2_WORKER_READ);
+
+    pthread_mutex_lock(&g_directory.mtx);
+    if (!concurrent_read && g_directory.read_overlap_epoch != start_overlap_epoch) {
+        concurrent_read = 1;
+    }
+    g_directory.active_readers--;
+    if (g_directory.active_readers == 0) {
+        pthread_cond_broadcast(&g_directory.cv);
+    }
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    if (concurrent_read) {
+        print_line("[Worker-%d] [concurrent read] FILE: %s SIZE: %u bytes", worker_id, entry->name, observed_size);
+    } else {
+        print_line("[Worker-%d] FILE: %s SIZE: %u bytes", worker_id, entry->name, observed_size);
+    }
+}
+
+static void perform_manager_write(int manager_id, DirectoryEntry *entry) {
+    int waiting_message_printed = 0;
+    unsigned int old_size;
+    unsigned int new_size;
+
+    pthread_mutex_lock(&g_directory.mtx);
+    g_directory.waiting_managers++;
+    while (g_directory.writer_active || g_directory.active_readers > 0 || g_directory.waiting_supervisors > 0) {
+        if (!waiting_message_printed) {
+            print_line("[Manager-%d] waiting for write lock", manager_id);
+            waiting_message_printed = 1;
+        }
+        pthread_cond_wait(&g_directory.cv, &g_directory.mtx);
+    }
+
+    g_directory.waiting_managers--;
+    g_directory.writer_active = 1;
+    old_size = entry->size_bytes;
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    print_line("[Manager-%d] acquired write lock", manager_id);
+    simulate_work(OP_Q2_MANAGER_HANDLE);
+
+    new_size = (old_size > UINT_MAX / 2u) ? UINT_MAX : old_size * 2u;
+
+    pthread_mutex_lock(&g_directory.mtx);
+    entry->size_bytes = new_size;
+    g_directory.writer_active = 0;
+    pthread_cond_broadcast(&g_directory.cv);
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    print_line("[Manager-%d] updated %s → %u bytes", manager_id, entry->name, new_size);
+}
+
+static void perform_supervisor_write(int supervisor_id, DirectoryEntry *entry) {
+    int preempts_manager = 0;
+    unsigned int old_size;
+    unsigned int new_size;
+
+    pthread_mutex_lock(&g_directory.mtx);
+    g_directory.waiting_supervisors++;
+    while (g_directory.writer_active || g_directory.active_readers > 0) {
+        pthread_cond_wait(&g_directory.cv, &g_directory.mtx);
+    }
+
+    preempts_manager = (g_directory.waiting_managers > 0);
+    g_directory.waiting_supervisors--;
+    g_directory.writer_active = 1;
+    old_size = entry->size_bytes;
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    if (preempts_manager) {
+        print_line("[Supervisor-%d] [supervisor preempts manager] acquired write lock", supervisor_id);
+    } else {
+        print_line("[Supervisor-%d] acquired write lock", supervisor_id);
+    }
+
+    simulate_work(OP_Q2_SUPERVISOR_UPDATE);
+
+    new_size = (old_size > UINT_MAX / 2u) ? UINT_MAX : old_size * 2u;
+
+    pthread_mutex_lock(&g_directory.mtx);
+    entry->size_bytes = new_size;
+    g_directory.writer_active = 0;
+    pthread_cond_broadcast(&g_directory.cv);
+    pthread_mutex_unlock(&g_directory.mtx);
+
+    print_line("[Supervisor-%d] updated %s → %u bytes", supervisor_id, entry->name, new_size);
+}
+
+static void *role_thread_main(void *arg) {
+    ThreadCtx *ctx = (ThreadCtx *)arg;
+
+    for (int i = 0; i < ctx->ops->size; i++) {
+        Operation *op = &ctx->ops->data[i];
+        DirectoryEntry *entry = registry_get_entry(&g_registry, op->entry_index);
+
+        if (ctx->role == ROLE_WORKER) {
+            perform_worker_read(ctx->id, entry);
+        } else if (ctx->role == ROLE_MANAGER) {
+            perform_manager_write(ctx->id, entry);
+        } else {
+            perform_supervisor_write(ctx->id, entry);
         }
     }
 
-    for (int i = 0; i < g_num_managers; i++) {
-        for (int j = 0; j < g_manager_ops[i].size; j++) {
-            registry_get_or_create(&g_registry, g_manager_ops[i].data[j].item);
-        }
-    }
-
-    for (int i = 0; i < g_num_supervisors; i++) {
-        for (int j = 0; j < g_supervisor_ops[i].size; j++) {
-            registry_get_or_create(&g_registry, g_supervisor_ops[i].data[j].item);
-        }
-    }
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -413,42 +462,41 @@ int main(int argc, char **argv) {
     }
 
     parse_input(argv[1]);
-    registry_init(&g_registry);
-    preregister_items();
+    directory_state_init(&g_directory);
 
     int total_threads = g_num_workers + g_num_managers + g_num_supervisors;
     pthread_t *threads = xmalloc((size_t)total_threads * sizeof(pthread_t));
-    ThreadCtx *ctx = xmalloc((size_t)total_threads * sizeof(ThreadCtx));
-    int t = 0;
+    ThreadCtx *contexts = xmalloc((size_t)total_threads * sizeof(ThreadCtx));
+    int next_thread = 0;
 
     for (int i = 0; i < g_num_workers; i++) {
-        ctx[t].role = ROLE_WORKER;
-        ctx[t].id = i;
-        ctx[t].ops = &g_worker_ops[i];
-        if (pthread_create(&threads[t], NULL, role_thread_main, &ctx[t]) != 0) {
+        contexts[next_thread].role = ROLE_WORKER;
+        contexts[next_thread].id = i;
+        contexts[next_thread].ops = &g_worker_ops[i];
+        if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create worker failed");
         }
-        t++;
+        next_thread++;
     }
 
     for (int i = 0; i < g_num_managers; i++) {
-        ctx[t].role = ROLE_MANAGER;
-        ctx[t].id = i;
-        ctx[t].ops = &g_manager_ops[i];
-        if (pthread_create(&threads[t], NULL, role_thread_main, &ctx[t]) != 0) {
+        contexts[next_thread].role = ROLE_MANAGER;
+        contexts[next_thread].id = i;
+        contexts[next_thread].ops = &g_manager_ops[i];
+        if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create manager failed");
         }
-        t++;
+        next_thread++;
     }
 
     for (int i = 0; i < g_num_supervisors; i++) {
-        ctx[t].role = ROLE_SUPERVISOR;
-        ctx[t].id = i;
-        ctx[t].ops = &g_supervisor_ops[i];
-        if (pthread_create(&threads[t], NULL, role_thread_main, &ctx[t]) != 0) {
+        contexts[next_thread].role = ROLE_SUPERVISOR;
+        contexts[next_thread].id = i;
+        contexts[next_thread].ops = &g_supervisor_ops[i];
+        if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create supervisor failed");
         }
-        t++;
+        next_thread++;
     }
 
     for (int i = 0; i < total_threads; i++) {
@@ -458,9 +506,10 @@ int main(int argc, char **argv) {
     }
 
     free(threads);
-    free(ctx);
-    registry_destroy(&g_registry);
+    free(contexts);
     destroy_role_op_arrays();
+    directory_state_destroy(&g_directory);
+    registry_destroy(&g_registry);
 
     return EXIT_SUCCESS;
 }
