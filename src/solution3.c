@@ -49,11 +49,17 @@ typedef struct {
     int cap;
 } IntQueue;
 
+/* die - Print error message to stderr and exit.
+ * Args: msg - error message
+ * Return: does not return */
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     exit(EXIT_FAILURE);
 }
 
+/* xmalloc - Allocate memory; exit on failure.
+ * Args: size - number of bytes
+ * Return: pointer to allocated memory */
 static void *xmalloc(size_t size) {
     void *ptr = malloc(size);
 
@@ -63,6 +69,9 @@ static void *xmalloc(size_t size) {
     return ptr;
 }
 
+/* xrealloc - Reallocate memory; exit on failure.
+ * Args: ptr - existing pointer, size - new byte size
+ * Return: pointer to reallocated memory */
 static void *xrealloc(void *ptr, size_t size) {
     void *next = realloc(ptr, size);
 
@@ -72,12 +81,18 @@ static void *xrealloc(void *ptr, size_t size) {
     return next;
 }
 
+/* segments_init - Initialise an empty Gantt segment list.
+ * Args: list - segment list to initialise
+ * Return: void */
 static void segments_init(SegmentList *list) {
     list->data = NULL;
     list->size = 0;
     list->cap = 0;
 }
 
+/* segments_push - Append a Gantt segment; merges with previous if contiguous and same job.
+ * Args: list - segment list, job_index - job index (-1 for idle), start - start time, end - end time
+ * Return: void */
 static void segments_push(SegmentList *list, int job_index, int start, int end) {
     Segment *last;
 
@@ -105,6 +120,9 @@ static void segments_push(SegmentList *list, int job_index, int start, int end) 
     list->size++;
 }
 
+/* segments_destroy - Free segment list storage.
+ * Args: list - segment list to destroy
+ * Return: void */
 static void segments_destroy(SegmentList *list) {
     free(list->data);
     list->data = NULL;
@@ -112,6 +130,9 @@ static void segments_destroy(SegmentList *list) {
     list->cap = 0;
 }
 
+/* queue_init - Initialise an integer circular queue.
+ * Args: queue - queue to initialise, initial_cap - initial capacity
+ * Return: void */
 static void queue_init(IntQueue *queue, int initial_cap) {
     queue->cap = (initial_cap > 0) ? initial_cap : 8;
     queue->data = xmalloc((size_t)queue->cap * sizeof(int));
@@ -120,6 +141,9 @@ static void queue_init(IntQueue *queue, int initial_cap) {
     queue->size = 0;
 }
 
+/* queue_grow - Double the queue capacity (internal helper).
+ * Args: queue - queue to grow
+ * Return: void */
 static void queue_grow(IntQueue *queue) {
     int *new_data = xmalloc((size_t)queue->cap * 2u * sizeof(int));
 
@@ -134,6 +158,9 @@ static void queue_grow(IntQueue *queue) {
     queue->tail = queue->size;
 }
 
+/* queue_push - Enqueue a value.
+ * Args: queue - target queue, value - integer to enqueue
+ * Return: void */
 static void queue_push(IntQueue *queue, int value) {
     if (queue->size == queue->cap) {
         queue_grow(queue);
@@ -144,6 +171,9 @@ static void queue_push(IntQueue *queue, int value) {
     queue->size++;
 }
 
+/* queue_pop - Dequeue and return the front value; exits on underflow.
+ * Args: queue - source queue
+ * Return: dequeued integer */
 static int queue_pop(IntQueue *queue) {
     int value;
 
@@ -157,10 +187,16 @@ static int queue_pop(IntQueue *queue) {
     return value;
 }
 
+/* queue_empty - Check if the queue has no elements.
+ * Args: queue - queue to check
+ * Return: 1 if empty, 0 otherwise */
 static int queue_empty(const IntQueue *queue) {
     return queue->size == 0;
 }
 
+/* queue_destroy - Free queue storage.
+ * Args: queue - queue to destroy
+ * Return: void */
 static void queue_destroy(IntQueue *queue) {
     free(queue->data);
     queue->data = NULL;
@@ -170,6 +206,9 @@ static void queue_destroy(IntQueue *queue) {
     queue->cap = 0;
 }
 
+/* compare_jobs_by_arrival - qsort comparator: order by arrival time, then input index.
+ * Args: lhs, rhs - pointers to Job structs
+ * Return: negative/zero/positive per qsort convention */
 static int compare_jobs_by_arrival(const void *lhs, const void *rhs) {
     const Job *a = lhs;
     const Job *b = rhs;
@@ -180,6 +219,9 @@ static int compare_jobs_by_arrival(const void *lhs, const void *rhs) {
     return (a->index < b->index) ? -1 : (a->index > b->index);
 }
 
+/* parse_jobs - Read job definitions from a file.
+ * Args: path - input file path, jobs_out - output pointer to allocated Job array
+ * Return: number of jobs read */
 static int parse_jobs(const char *path, Job **jobs_out) {
     FILE *fp = fopen(path, "r");
     Job *jobs = NULL;
@@ -223,6 +265,9 @@ static int parse_jobs(const char *path, Job **jobs_out) {
     return size;
 }
 
+/* make_sim_jobs - Create simulation state array from parsed jobs.
+ * Args: jobs - source job array, count - number of jobs
+ * Return: allocated SimJob array with remaining times set to burst */
 static SimJob *make_sim_jobs(const Job *jobs, int count) {
     SimJob *sim_jobs = xmalloc((size_t)count * sizeof(SimJob));
 
@@ -235,6 +280,9 @@ static SimJob *make_sim_jobs(const Job *jobs, int count) {
     return sim_jobs;
 }
 
+/* total_burst_time - Sum burst times of all jobs.
+ * Args: jobs - job array, count - number of jobs
+ * Return: total burst time */
 static int total_burst_time(const Job *jobs, int count) {
     int total = 0;
 
@@ -244,6 +292,10 @@ static int total_burst_time(const Job *jobs, int count) {
     return total;
 }
 
+/* finalize_metrics - Compute avg turnaround, avg waiting, and CPU utilisation.
+ * Args: result - output result, jobs - original jobs, sim_jobs - simulation state,
+ *       count - job count, total_burst - sum of all burst times
+ * Return: void */
 static void finalize_metrics(ScheduleResult *result, const Job *jobs, const SimJob *sim_jobs, int count, int total_burst) {
     double total_turnaround = 0.0;
     double total_waiting = 0.0;
@@ -276,6 +328,9 @@ static void finalize_metrics(ScheduleResult *result, const Job *jobs, const SimJ
     result->cpu_util = (makespan == 0) ? 0.0 : (100.0 * (double)total_burst) / (double)makespan;
 }
 
+/* make_empty_result - Create a zeroed ScheduleResult with the given label.
+ * Args: label - algorithm name string
+ * Return: initialised ScheduleResult */
 static ScheduleResult make_empty_result(const char *label) {
     ScheduleResult result;
 
@@ -288,6 +343,9 @@ static ScheduleResult make_empty_result(const char *label) {
     return result;
 }
 
+/* sjf_better - Comparator for SJF: prefer shorter remaining, earlier arrival, lower index.
+ * Args: candidate, best - SimJob pointers to compare
+ * Return: 1 if candidate should preempt best, 0 otherwise */
 static int sjf_better(const SimJob *candidate, const SimJob *best) {
     if (candidate->remaining != best->remaining) {
         return candidate->remaining < best->remaining;
@@ -298,6 +356,9 @@ static int sjf_better(const SimJob *candidate, const SimJob *best) {
     return candidate->job.index < best->job.index;
 }
 
+/* priority_better - Comparator for Priority: prefer lower priority number, then SJF ties.
+ * Args: candidate, best - SimJob pointers to compare
+ * Return: 1 if candidate should preempt best, 0 otherwise */
 static int priority_better(const SimJob *candidate, const SimJob *best) {
     if (candidate->job.priority != best->job.priority) {
         return candidate->job.priority < best->job.priority;
@@ -311,6 +372,9 @@ static int priority_better(const SimJob *candidate, const SimJob *best) {
     return candidate->job.index < best->job.index;
 }
 
+/* next_arrival_time - Find the earliest arrival after current_time among incomplete jobs.
+ * Args: sim_jobs - simulation array, count - job count, current_time - current clock
+ * Return: next arrival time, or INT_MAX if none */
 static int next_arrival_time(const SimJob *sim_jobs, int count, int current_time) {
     int next = INT_MAX;
 
@@ -322,6 +386,10 @@ static int next_arrival_time(const SimJob *sim_jobs, int count, int current_time
     return next;
 }
 
+/* select_ready_job - Choose the best ready job at current_time using the given comparator.
+ * Args: sim_jobs - simulation array, count - job count, current_time - current clock,
+ *       better - comparator function
+ * Return: index of selected job, or -1 if none ready */
 static int select_ready_job(const SimJob *sim_jobs, int count, int current_time,
     int (*better)(const SimJob *, const SimJob *)) {
     int best_index = -1;
@@ -338,6 +406,9 @@ static int select_ready_job(const SimJob *sim_jobs, int count, int current_time,
     return best_index;
 }
 
+/* simulate_fcfs - Run First-Come-First-Served scheduling simulation.
+ * Args: jobs - job array, count - job count, total_burst - sum of burst times
+ * Return: ScheduleResult with Gantt chart and metrics */
 static ScheduleResult simulate_fcfs(const Job *jobs, int count, int total_burst) {
     Job *ordered = NULL;
     SimJob *sim_jobs = make_sim_jobs(jobs, count);
@@ -373,6 +444,10 @@ static ScheduleResult simulate_fcfs(const Job *jobs, int count, int total_burst)
     return result;
 }
 
+/* simulate_preemptive - Run a preemptive scheduling simulation (SJF or Priority).
+ * Args: jobs - job array, count - job count, total_burst - sum of burst times,
+ *       label - algorithm name, better - comparator for job selection
+ * Return: ScheduleResult with Gantt chart and metrics */
 static ScheduleResult simulate_preemptive(const Job *jobs, int count, int total_burst,
     const char *label, int (*better)(const SimJob *, const SimJob *)) {
     SimJob *sim_jobs = make_sim_jobs(jobs, count);
@@ -409,6 +484,10 @@ static ScheduleResult simulate_preemptive(const Job *jobs, int count, int total_
     return result;
 }
 
+/* enqueue_arrivals - Add all jobs arriving at or before current_time to the ready queue.
+ * Args: queue - ready queue, ordered - arrival-sorted jobs, count - job count,
+ *       next_arrival_idx - pointer to next index to check, current_time - current clock
+ * Return: void */
 static void enqueue_arrivals(IntQueue *queue, const Job *ordered, int count, int *next_arrival_idx, int current_time) {
     while (*next_arrival_idx < count && ordered[*next_arrival_idx].arrival <= current_time) {
         queue_push(queue, ordered[*next_arrival_idx].index);
@@ -416,6 +495,10 @@ static void enqueue_arrivals(IntQueue *queue, const Job *ordered, int count, int
     }
 }
 
+/* simulate_rr - Run Round-Robin scheduling simulation with the given time quantum.
+ * Args: jobs - job array, count - job count, total_burst - sum of burst times,
+ *       quantum - time slice, label - algorithm name
+ * Return: ScheduleResult with Gantt chart and metrics */
 static ScheduleResult simulate_rr(const Job *jobs, int count, int total_burst, int quantum, const char *label) {
     Job *ordered = NULL;
     SimJob *sim_jobs = make_sim_jobs(jobs, count);
@@ -478,10 +561,16 @@ static ScheduleResult simulate_rr(const Job *jobs, int count, int total_burst, i
     return result;
 }
 
+/* segment_name - Return the job id string for a Gantt segment, or "idle".
+ * Args: segment - Gantt segment, jobs - job array
+ * Return: name string */
 static const char *segment_name(const Segment *segment, const Job *jobs) {
     return (segment->job_index == -1) ? "idle" : jobs[segment->job_index].id;
 }
 
+/* print_gantt - Print a Gantt chart to stdout.
+ * Args: gantt - segment list, jobs - job array
+ * Return: void */
 static void print_gantt(const SegmentList *gantt, const Job *jobs) {
     if (gantt->size == 0) {
         printf("Gantt: | |\n");
@@ -502,6 +591,9 @@ static void print_gantt(const SegmentList *gantt, const Job *jobs) {
     printf("\n");
 }
 
+/* print_metrics - Print per-job metrics table and averages.
+ * Args: result - schedule result, jobs - job array, count - job count
+ * Return: void */
 static void print_metrics(const ScheduleResult *result, const Job *jobs, int count) {
     printf("%-8s %-8s %-8s %-12s %-12s %-8s\n",
         "Job", "Arrival", "Burst", "Completion", "Turnaround", "Waiting");
@@ -525,6 +617,9 @@ static void print_metrics(const ScheduleResult *result, const Job *jobs, int cou
     printf("CPU Utilisation : %.2f%%\n", result->cpu_util);
 }
 
+/* print_schedule - Print Gantt chart and metrics for one algorithm.
+ * Args: result - schedule result, jobs - job array, count - job count
+ * Return: void */
 static void print_schedule(const ScheduleResult *result, const Job *jobs, int count) {
     printf("=== %s ===\n", result->label);
     print_gantt(&result->gantt, jobs);
@@ -532,6 +627,9 @@ static void print_schedule(const ScheduleResult *result, const Job *jobs, int co
     printf("\n");
 }
 
+/* scaled_bar_length - Compute bar chart width proportional to value/max_value.
+ * Args: value - data point, max_value - maximum data point
+ * Return: character width for the bar */
 static int scaled_bar_length(double value, double max_value) {
     if (max_value <= 0.0 || value <= 0.0) {
         return 0;
@@ -540,6 +638,9 @@ static int scaled_bar_length(double value, double max_value) {
     return (int)((value / max_value) * BAR_WIDTH + 0.5);
 }
 
+/* print_comparison - Print comparative analysis table and bar chart across algorithms.
+ * Args: results - array of schedule results, count - number of results
+ * Return: void */
 static void print_comparison(const ScheduleResult *results, int count) {
     double max_wait = 0.0;
 
@@ -571,12 +672,20 @@ static void print_comparison(const ScheduleResult *results, int count) {
     }
 }
 
+/* destroy_result - Free a ScheduleResult's dynamically allocated memory.
+ * Args: result - result to destroy
+ * Return: void */
 static void destroy_result(ScheduleResult *result) {
     free(result->completion);
     result->completion = NULL;
     segments_destroy(&result->gantt);
 }
 
+/* simulate_mlfq - Run Multi-Level Feedback Queue scheduling simulation.
+ *                 Level 1: RR q=4, Level 2: RR q=8, Level 3: FCFS (run to completion).
+ *                 Jobs start at Level 1 and are demoted when they exhaust their quantum.
+ * Args: jobs - job array, count - job count, total_burst - sum of burst times
+ * Return: ScheduleResult with Gantt chart and metrics */
 static ScheduleResult simulate_mlfq(const Job *jobs, int count, int total_burst) {
     Job *ordered = NULL;
     SimJob *sim_jobs = make_sim_jobs(jobs, count);
