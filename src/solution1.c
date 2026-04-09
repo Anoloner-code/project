@@ -5,7 +5,6 @@
 #include <semaphore.h>
 #include <errno.h>
 
-/* Error handling macros */
 #define CHECK(cond, msg) do { if (!(cond)) { perror(msg); exit(EXIT_FAILURE); } } while(0)
 #define SEM_WAIT(s) do { while (sem_wait(s) == -1 && errno == EINTR); CHECK(errno == 0, "sem_wait"); } while(0)
 #define SEM_POST(s) CHECK(sem_post(s) == 0, "sem_post")
@@ -31,7 +30,6 @@ typedef struct {
     pthread_cond_t cv;
 } TokenPool;
 
-/* Global state */
 static int P, M, N, num_orders, T;
 static int *token_init_cnt, *tA, *tB;
 static Buffer bufferA, bufferB;
@@ -175,7 +173,6 @@ void *logger_thread(void *arg) {
 }
 
 static void parse_config(int argc, char **argv) {
-    /* Parse from file or CLI */
     if (argc == 2) {
         FILE *fp = fopen(argv[1], "r");
         CHECK(fp != NULL, "fopen");
@@ -213,7 +210,6 @@ static void parse_config(int argc, char **argv) {
         }
     }
 
-    /* Validate */
     CHECK(P > 0 && M > 0 && N > 0 && T > 0 && num_orders >= 0, "invalid params");
     for (int i = 0; i < T; i++)
         CHECK(token_init_cnt[i] >= 0, "negative token count");
@@ -236,7 +232,6 @@ int main(int argc, char **argv) {
     e_ids = malloc(P * sizeof(int));
     CHECK(quant_threads && enc_threads && q_ids && e_ids, "malloc");
 
-    /* Create threads */
     for (int i = 0; i < P; i++) {
         q_ids[i] = i;
         CHECK(pthread_create(&quant_threads[i], NULL, quantizer_thread, &q_ids[i]) == 0, "pthread_create quantizer");
@@ -247,22 +242,18 @@ int main(int argc, char **argv) {
     }
     CHECK(pthread_create(&logger_tid, NULL, logger_thread, NULL) == 0, "pthread_create logger");
 
-    /* Wait for quantizers to finish */
     for (int i = 0; i < P; i++)
         CHECK(pthread_join(quant_threads[i], NULL) == 0, "pthread_join quantizer");
 
-    /* Send sentinels */
     for (int i = 0; i < P; i++) {
         RawPacket s = {-1, 0, -1, 1};
         buf_put(&bufferA, &s, sizeof(RawPacket));
     }
 
-    /* Wait for encoders and logger */
     for (int i = 0; i < P; i++)
         CHECK(pthread_join(enc_threads[i], NULL) == 0, "pthread_join encoder");
     CHECK(pthread_join(logger_tid, NULL) == 0, "pthread_join logger");
 
-    /* Cleanup */
     buf_destroy(&bufferA);
     buf_destroy(&bufferB);
     token_pool_destroy(&pool);
