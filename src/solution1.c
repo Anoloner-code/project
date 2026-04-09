@@ -5,6 +5,8 @@
 #include <semaphore.h>
 #include <errno.h>
 
+#include "helpers.h"
+
 #define CHECK(cond, msg) do { \
     if (!(cond)) { \
         fprintf(stderr, "Error: %s\n", msg); \
@@ -145,6 +147,7 @@ void *quantizer_thread(void *arg) {
         next_order_id++;
         pthread_mutex_unlock(&next_order_mtx);
 
+        simulate_work(OP_Q1_QUANTIZE);
         RawPacket p = {oid, oid + 1, oid % T, 0};
         buf_put(&bufferA, &p, sizeof(RawPacket));
     }
@@ -166,6 +169,7 @@ void *encoder_thread(void *arg) {
         }
 
         acquire_tokens(&pool, a, b);
+        simulate_work(OP_Q1_ENCODE);
         EncodedPacket ep = {rp.order_id, rp.raw_value * 2 + a + b, 0};
         release_tokens(&pool, a, b);
 
@@ -183,6 +187,7 @@ void *logger_thread(void *arg) {
         if (ep.is_sentinel) {
             seen_sentinels++;
         } else {
+            simulate_work(OP_Q1_LOG);
             printf("[Logger] order_id=%d encoded=%d\n", ep.order_id, ep.encoded_value);
             fflush(stdout);
         }

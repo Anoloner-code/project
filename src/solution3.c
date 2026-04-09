@@ -577,9 +577,107 @@ static void destroy_result(ScheduleResult *result) {
     segments_destroy(&result->gantt);
 }
 
+static ScheduleResult simulate_mlfq(const Job *jobs, int count, int total_burst) {
+    Job *ordered = NULL;
+    SimJob *sim_jobs = make_sim_jobs(jobs, count);
+    ScheduleResult result = make_empty_result("MLFQ");
+    IntQueue q1, q2, q3;
+    int *level;
+    int current_time = 0;
+    int completed = 0;
+    int next_arrival_idx = 0;
+    int current_job = -1;
+    int slice_used = 0;
+    int current_quantum = 0;
+
+    queue_init(&q1, count + 1);
+    queue_init(&q2, count + 1);
+    queue_init(&q3, count + 1);
+    level = xmalloc((size_t)count * sizeof(int));
+    for (int i = 0; i < count; i++) {
+        level[i] = 1;
+    }
+
+    if (count > 0) {
+        ordered = xmalloc((size_t)count * sizeof(Job));
+        memcpy(ordered, jobs, (size_t)count * sizeof(Job));
+        qsort(ordered, (size_t)count, sizeof(Job), compare_jobs_by_arrival);
+    }
+
+    while (completed < count) {
+        while (next_arrival_idx < count && ordered[next_arrival_idx].arrival <= current_time) {
+            int idx = ordered[next_arrival_idx].index;
+            queue_push(&q1, idx);
+            level[idx] = 1;
+            next_arrival_idx++;
+        }
+
+        if (current_job == -1) {
+            if (!queue_empty(&q1)) {
+                current_job = queue_pop(&q1);
+                current_quantum = 4;
+            } else if (!queue_empty(&q2)) {
+                current_job = queue_pop(&q2);
+                current_quantum = 8;
+            } else if (!queue_empty(&q3)) {
+                current_job = queue_pop(&q3);
+                current_quantum = sim_jobs[current_job].remaining;
+            } else {
+                if (next_arrival_idx >= count) {
+                    break;
+                }
+                segments_push(&result.gantt, -1, current_time, ordered[next_arrival_idx].arrival);
+                current_time = ordered[next_arrival_idx].arrival;
+                continue;
+            }
+            slice_used = 0;
+        }
+
+        segments_push(&result.gantt, current_job, current_time, current_time + 1);
+        sim_jobs[current_job].remaining--;
+        current_time++;
+        slice_used++;
+
+        while (next_arrival_idx < count && ordered[next_arrival_idx].arrival <= current_time) {
+            int idx = ordered[next_arrival_idx].index;
+            queue_push(&q1, idx);
+            level[idx] = 1;
+            next_arrival_idx++;
+        }
+
+        if (sim_jobs[current_job].remaining == 0) {
+            sim_jobs[current_job].completion = current_time;
+            current_job = -1;
+            slice_used = 0;
+            completed++;
+        } else if (slice_used == current_quantum) {
+            int cur_level = level[current_job];
+            if (cur_level < 3) {
+                level[current_job] = cur_level + 1;
+            }
+            if (level[current_job] == 2) {
+                queue_push(&q2, current_job);
+            } else {
+                queue_push(&q3, current_job);
+            }
+            current_job = -1;
+            slice_used = 0;
+        }
+    }
+
+    finalize_metrics(&result, jobs, sim_jobs, count, total_burst);
+    free(ordered);
+    free(sim_jobs);
+    free(level);
+    queue_destroy(&q1);
+    queue_destroy(&q2);
+    queue_destroy(&q3);
+    return result;
+}
+
 int main(int argc, char **argv) {
     Job *jobs = NULL;
-    ScheduleResult results[5];
+    ScheduleResult results[6];
     int count;
     int total_burst;
 
@@ -596,13 +694,14 @@ int main(int argc, char **argv) {
     results[2] = simulate_preemptive(jobs, count, total_burst, "Priority (Preemptive)", priority_better);
     results[3] = simulate_rr(jobs, count, total_burst, 3, "RR (q=3)");
     results[4] = simulate_rr(jobs, count, total_burst, 6, "RR (q=6)");
+    results[5] = simulate_mlfq(jobs, count, total_burst);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         print_schedule(&results[i], jobs, count);
     }
-    print_comparison(results, 5);
+    print_comparison(results, 6);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         destroy_result(&results[i]);
     }
 
