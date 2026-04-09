@@ -192,13 +192,14 @@ static void parse_config(int argc, char **argv) {
             CHECK(fscanf(fp, " ( %d , %d )", &tA[i], &tB[i]) == 2, "fscanf pair");
         fclose(fp);
     } else {
-        CHECK(argc == 1 + 5 + T + 2 * P, "argument count");
+        CHECK(argc >= 6, "too few arguments");
         P = parse_int(argv[1]);
         M = parse_int(argv[2]);
         N = parse_int(argv[3]);
         num_orders = parse_int(argv[4]);
         T = parse_int(argv[5]);
-        
+        CHECK(argc == 1 + 5 + T + 2 * P, "argument count");
+
         token_init_cnt = malloc(T * sizeof(int));
         tA = malloc(P * sizeof(int));
         tB = malloc(P * sizeof(int));
