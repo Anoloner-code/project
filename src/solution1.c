@@ -4,8 +4,16 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "helpers.h"
+
+/* Sentinel flag values for is_sentinel field */
+#define NOT_SENTINEL 0
+#define IS_SENTINEL  1
+
+/* Number of positional CLI args before token counts: prog P M N num_orders T */
+#define CLI_BASE_ARGC 6
 
 #define CHECK(cond, msg) do { \
     if (!(cond)) { \
@@ -68,7 +76,7 @@ static int parse_int(const char *s) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     CHECK(s[0] != '\0' && *end == '\0', "parse_int: invalid format");
-    CHECK(v >= -2147483648L && v <= 2147483647L, "parse_int: out of range");
+    CHECK(v >= (long)INT_MIN && v <= (long)INT_MAX, "parse_int: out of range");
     return (int)v;
 }
 
@@ -199,7 +207,7 @@ void *quantizer_thread(void *arg) {
         pthread_mutex_unlock(&next_order_mtx);
 
         simulate_work(OP_Q1_QUANTIZE);
-        RawPacket p = {oid, oid + 1, oid % T, 0};
+        RawPacket p = {oid, oid + 1, oid % T, NOT_SENTINEL};
         buf_put(&bufferA, &p, sizeof(RawPacket));
     }
     return NULL;
@@ -220,14 +228,14 @@ void *encoder_thread(void *arg) {
         buf_get(&bufferA, &rp, sizeof(RawPacket));
 
         if (rp.is_sentinel) {
-            EncodedPacket sp = {-1, 0, 1};
+            EncodedPacket sp = {-1, 0, IS_SENTINEL};
             buf_put(&bufferB, &sp, sizeof(EncodedPacket));
             break;
         }
 
         acquire_tokens(&pool, a, b);
         simulate_work(OP_Q1_ENCODE);
-        EncodedPacket ep = {rp.order_id, rp.raw_value * 2 + a + b, 0};
+        EncodedPacket ep = {rp.order_id, rp.raw_value * 2 + a + b, NOT_SENTINEL};
         release_tokens(&pool, a, b);
 
         buf_put(&bufferB, &ep, sizeof(EncodedPacket));
@@ -279,13 +287,14 @@ static void parse_config(int argc, char **argv) {
             CHECK(fscanf(fp, " ( %d , %d )", &tA[i], &tB[i]) == 2, "fscanf pair");
         fclose(fp);
     } else {
-        CHECK(argc >= 6, "too few arguments");
+        CHECK(argc >= CLI_BASE_ARGC, "too few arguments");
         P = parse_int(argv[1]);
         M = parse_int(argv[2]);
         N = parse_int(argv[3]);
         num_orders = parse_int(argv[4]);
         T = parse_int(argv[5]);
-        CHECK(argc == 1 + 5 + T + 2 * P, "argument count");
+        /* expected: prog + 5 params + T token counts + 2*P token pairs */
+        CHECK(argc == CLI_BASE_ARGC + T + 2 * P, "argument count");
 
         token_init_cnt = malloc(T * sizeof(int));
         tA = malloc(P * sizeof(int));
@@ -309,41 +318,70 @@ static void parse_config(int argc, char **argv) {
     }
 }
 
-int main(int argc, char **argv) {
-    parse_config(argc, argv);
-
+/*
+ * setup_pipeline - Initialise buffers and token pool; allocate thread handle arrays.
+ * Args: none (uses globals P, M, N, T, token_init_cnt)
+ * Return: void
+ */
+static void setup_pipeline(void) {
     buf_init(&bufferA, M, sizeof(RawPacket));
     buf_init(&bufferB, N, sizeof(EncodedPacket));
     token_pool_init(&pool, T, token_init_cnt);
 
     quant_threads = malloc(P * sizeof(pthread_t));
-    enc_threads = malloc(P * sizeof(pthread_t));
-    q_ids = malloc(P * sizeof(int));
-    e_ids = malloc(P * sizeof(int));
+    enc_threads   = malloc(P * sizeof(pthread_t));
+    q_ids         = malloc(P * sizeof(int));
+    e_ids         = malloc(P * sizeof(int));
     CHECK(quant_threads && enc_threads && q_ids && e_ids, "malloc failed");
+}
 
+/*
+ * launch_threads - Spawn P quantizer threads, P encoder threads, and 1 logger thread.
+ * Args: none (uses globals P, q_ids, e_ids, quant_threads, enc_threads, logger_tid)
+ * Return: void
+ */
+static void launch_threads(void) {
     for (int i = 0; i < P; i++) {
         q_ids[i] = i;
-        CHECK(pthread_create(&quant_threads[i], NULL, quantizer_thread, &q_ids[i]) == 0, "pthread_create quantizer");
+        CHECK(pthread_create(&quant_threads[i], NULL, quantizer_thread, &q_ids[i]) == 0,
+              "pthread_create quantizer");
     }
     for (int i = 0; i < P; i++) {
         e_ids[i] = i;
-        CHECK(pthread_create(&enc_threads[i], NULL, encoder_thread, &e_ids[i]) == 0, "pthread_create encoder");
+        CHECK(pthread_create(&enc_threads[i], NULL, encoder_thread, &e_ids[i]) == 0,
+              "pthread_create encoder");
     }
-    CHECK(pthread_create(&logger_tid, NULL, logger_thread, NULL) == 0, "pthread_create logger");
+    CHECK(pthread_create(&logger_tid, NULL, logger_thread, NULL) == 0,
+          "pthread_create logger");
+}
 
+/*
+ * shutdown_pipeline - Join quantizers, inject P sentinels into Buffer A,
+ *                     then join encoders and the logger thread.
+ * Args: none
+ * Return: void
+ */
+static void shutdown_pipeline(void) {
     for (int i = 0; i < P; i++)
         CHECK(pthread_join(quant_threads[i], NULL) == 0, "pthread_join quantizer");
 
+    /* One sentinel per encoder so every encoder exits its loop */
     for (int i = 0; i < P; i++) {
-        RawPacket s = {-1, 0, -1, 1};
+        RawPacket s = {-1, 0, -1, IS_SENTINEL};
         buf_put(&bufferA, &s, sizeof(RawPacket));
     }
 
     for (int i = 0; i < P; i++)
         CHECK(pthread_join(enc_threads[i], NULL) == 0, "pthread_join encoder");
     CHECK(pthread_join(logger_tid, NULL) == 0, "pthread_join logger");
+}
 
+/*
+ * cleanup - Destroy buffers and token pool; free all heap allocations.
+ * Args: none
+ * Return: void
+ */
+static void cleanup(void) {
     buf_destroy(&bufferA);
     buf_destroy(&bufferB);
     token_pool_destroy(&pool);
@@ -354,6 +392,18 @@ int main(int argc, char **argv) {
     free(enc_threads);
     free(q_ids);
     free(e_ids);
+}
 
+/*
+ * main - Entry point; parses configuration, runs the pipeline, then cleans up.
+ * Args: argc - argument count, argv - argument vector
+ * Return: 0 on success
+ */
+int main(int argc, char **argv) {
+    parse_config(argc, argv);
+    setup_pipeline();
+    launch_threads();
+    shutdown_pipeline();
+    cleanup();
     return 0;
 }
