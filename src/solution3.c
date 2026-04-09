@@ -5,6 +5,7 @@
 
 #define JOB_ID_MAX 63
 #define BAR_WIDTH 40
+#define NUM_ALGORITHMS 6
 
 typedef struct {
     char id[JOB_ID_MAX + 1];
@@ -786,7 +787,7 @@ static ScheduleResult simulate_mlfq(const Job *jobs, int count, int total_burst)
 
 int main(int argc, char **argv) {
     Job *jobs = NULL;
-    ScheduleResult results[6];
+    ScheduleResult results[NUM_ALGORITHMS];
     int count;
     int total_burst;
 
@@ -805,12 +806,12 @@ int main(int argc, char **argv) {
     results[4] = simulate_rr(jobs, count, total_burst, 6, "RR (q=6)");
     results[5] = simulate_mlfq(jobs, count, total_burst);
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < NUM_ALGORITHMS; i++) {
         print_schedule(&results[i], jobs, count);
     }
-    print_comparison(results, 6);
+    print_comparison(results, NUM_ALGORITHMS);
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < NUM_ALGORITHMS; i++) {
         destroy_result(&results[i]);
     }
 
