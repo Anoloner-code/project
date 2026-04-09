@@ -71,11 +71,17 @@ static DirectoryRegistry g_registry;
 static DirectoryState g_directory;
 static pthread_mutex_t g_print_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/* die - Print error message to stderr and exit.
+ * Args: msg - error message string
+ * Return: does not return */
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     exit(EXIT_FAILURE);
 }
 
+/* xmalloc - Allocate memory; exit on failure.
+ * Args: size - number of bytes
+ * Return: pointer to allocated memory, or NULL if size is 0 */
 static void *xmalloc(size_t size) {
     if (size == 0) {
         return NULL;
@@ -88,6 +94,9 @@ static void *xmalloc(size_t size) {
     return ptr;
 }
 
+/* print_line - Thread-safe formatted print with newline and flush.
+ * Args: fmt - printf format string, ... - format arguments
+ * Return: void */
 static void print_line(const char *fmt, ...) {
     va_list args;
 
@@ -100,12 +109,18 @@ static void print_line(const char *fmt, ...) {
     pthread_mutex_unlock(&g_print_mtx);
 }
 
+/* op_list_init - Initialise an empty operation list.
+ * Args: list - list to initialise
+ * Return: void */
 static void op_list_init(OpList *list) {
     list->data = NULL;
     list->size = 0;
     list->cap = 0;
 }
 
+/* op_list_push - Append an operation to the list, growing if needed.
+ * Args: list - target list, op - operation to append
+ * Return: void */
 static void op_list_push(OpList *list, const Operation *op) {
     if (list->size == list->cap) {
         int new_cap = (list->cap == 0) ? 8 : list->cap * 2;
@@ -120,6 +135,9 @@ static void op_list_push(OpList *list, const Operation *op) {
     list->data[list->size++] = *op;
 }
 
+/* op_list_destroy - Free the operation list's internal storage.
+ * Args: list - list to destroy
+ * Return: void */
 static void op_list_destroy(OpList *list) {
     free(list->data);
     list->data = NULL;
@@ -127,12 +145,18 @@ static void op_list_destroy(OpList *list) {
     list->cap = 0;
 }
 
+/* registry_init - Initialise an empty directory registry.
+ * Args: registry - registry to initialise
+ * Return: void */
 static void registry_init(DirectoryRegistry *registry) {
     registry->data = NULL;
     registry->size = 0;
     registry->cap = 0;
 }
 
+/* registry_destroy - Free registry internal storage.
+ * Args: registry - registry to destroy
+ * Return: void */
 static void registry_destroy(DirectoryRegistry *registry) {
     free(registry->data);
     registry->data = NULL;
@@ -140,6 +164,9 @@ static void registry_destroy(DirectoryRegistry *registry) {
     registry->cap = 0;
 }
 
+/* parse_item_number - Extract the numeric portion from an item name string.
+ * Args: item_name - item name (e.g., "item_0042.dat")
+ * Return: extracted integer, or 0 if no digits found */
 static int parse_item_number(const char *item_name) {
     int value = 0;
     int found_digit = 0;
@@ -154,12 +181,18 @@ static int parse_item_number(const char *item_name) {
     return found_digit ? value : 0;
 }
 
+/* initial_size_for_item - Compute the initial byte size for a directory entry.
+ * Args: item_name - item name string
+ * Return: initial size in bytes */
 static unsigned int initial_size_for_item(const char *item_name) {
     int item_number = parse_item_number(item_name);
     unsigned int multiplier = 1u << (item_number % 4);
     return 512u * multiplier;
 }
 
+/* registry_get_or_add - Look up an item by name; add it if not found.
+ * Args: registry - directory registry, item_name - name to look up
+ * Return: index of the entry in the registry */
 static int registry_get_or_add(DirectoryRegistry *registry, const char *item_name) {
     for (int i = 0; i < registry->size; i++) {
         if (strcmp(registry->data[i].name, item_name) == 0) {
@@ -185,6 +218,9 @@ static int registry_get_or_add(DirectoryRegistry *registry, const char *item_nam
     return registry->size - 1;
 }
 
+/* registry_get_entry - Retrieve a directory entry by index.
+ * Args: registry - directory registry, entry_index - zero-based index
+ * Return: pointer to the DirectoryEntry */
 static DirectoryEntry *registry_get_entry(DirectoryRegistry *registry, int entry_index) {
     if (entry_index < 0 || entry_index >= registry->size) {
         die("invalid directory entry index");
@@ -192,6 +228,9 @@ static DirectoryEntry *registry_get_entry(DirectoryRegistry *registry, int entry
     return &registry->data[entry_index];
 }
 
+/* directory_state_init - Initialise directory concurrency state (mutex + cond var).
+ * Args: state - state to initialise
+ * Return: void */
 static void directory_state_init(DirectoryState *state) {
     memset(state, 0, sizeof(*state));
     if (pthread_mutex_init(&state->mtx, NULL) != 0) {
@@ -202,11 +241,17 @@ static void directory_state_init(DirectoryState *state) {
     }
 }
 
+/* directory_state_destroy - Destroy directory concurrency state.
+ * Args: state - state to destroy
+ * Return: void */
 static void directory_state_destroy(DirectoryState *state) {
     pthread_mutex_destroy(&state->mtx);
     pthread_cond_destroy(&state->cv);
 }
 
+/* init_role_op_arrays - Allocate and initialise per-thread operation lists for each role.
+ * Args: none (uses globals g_num_workers, g_num_managers, g_num_supervisors)
+ * Return: void */
 static void init_role_op_arrays(void) {
     g_worker_ops = xmalloc((size_t)g_num_workers * sizeof(OpList));
     g_manager_ops = xmalloc((size_t)g_num_managers * sizeof(OpList));
@@ -223,6 +268,9 @@ static void init_role_op_arrays(void) {
     }
 }
 
+/* destroy_role_op_arrays - Free all per-thread operation lists.
+ * Args: none
+ * Return: void */
 static void destroy_role_op_arrays(void) {
     for (int i = 0; i < g_num_workers; i++) {
         op_list_destroy(&g_worker_ops[i]);
@@ -242,6 +290,9 @@ static void destroy_role_op_arrays(void) {
     g_supervisor_ops = NULL;
 }
 
+/* parse_input - Read and parse the Q2 input file (thread counts + operation list).
+ * Args: path - file path
+ * Return: void; populates global arrays and registry */
 static void parse_input(const char *path) {
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
@@ -323,6 +374,9 @@ static void parse_input(const char *path) {
     fclose(fp);
 }
 
+/* perform_worker_read - Execute a worker's read operation with priority-aware blocking.
+ * Args: worker_id - worker thread index, entry - directory entry to read
+ * Return: void */
 static void perform_worker_read(int worker_id, DirectoryEntry *entry) {
     int waiting_message_printed = 0;
     unsigned long start_overlap_epoch;
@@ -366,6 +420,9 @@ static void perform_worker_read(int worker_id, DirectoryEntry *entry) {
     }
 }
 
+/* perform_manager_write - Execute a manager's exclusive write operation.
+ * Args: manager_id - manager thread index, entry - directory entry to update
+ * Return: void */
 static void perform_manager_write(int manager_id, DirectoryEntry *entry) {
     int waiting_message_printed = 0;
     unsigned int old_size;
@@ -400,6 +457,9 @@ static void perform_manager_write(int manager_id, DirectoryEntry *entry) {
     print_line("[Manager-%d] updated %s → %u bytes", manager_id, entry->name, new_size);
 }
 
+/* perform_supervisor_write - Execute a supervisor's high-priority exclusive write.
+ * Args: supervisor_id - supervisor thread index, entry - directory entry to update
+ * Return: void */
 static void perform_supervisor_write(int supervisor_id, DirectoryEntry *entry) {
     int preempts_manager = 0;
     unsigned int old_size;
@@ -436,6 +496,9 @@ static void perform_supervisor_write(int supervisor_id, DirectoryEntry *entry) {
     print_line("[Supervisor-%d] updated %s → %u bytes", supervisor_id, entry->name, new_size);
 }
 
+/* role_thread_main - Generic thread entry point; dispatches operations by role.
+ * Args: arg - pointer to ThreadCtx with role, id, and operation list
+ * Return: NULL */
 static void *role_thread_main(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
 

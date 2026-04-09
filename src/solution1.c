@@ -5,6 +5,8 @@
 #include <semaphore.h>
 #include <errno.h>
 
+#include "helpers.h"
+
 #define CHECK(cond, msg) do { \
     if (!(cond)) { \
         fprintf(stderr, "Error: %s\n", msg); \
@@ -57,6 +59,11 @@ static int *q_ids, *e_ids;
 static int next_order_id = 0;
 static pthread_mutex_t next_order_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * parse_int - Parse a string as a 32-bit integer.
+ * Args: s - null-terminated decimal string
+ * Return: parsed int value; exits on invalid input
+ */
 static int parse_int(const char *s) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -65,6 +72,11 @@ static int parse_int(const char *s) {
     return (int)v;
 }
 
+/*
+ * buf_init - Initialise a bounded buffer and its synchronisation primitives.
+ * Args: b - buffer to initialise, cap - maximum slot count, elem_size - byte size of one element
+ * Return: void
+ */
 static void buf_init(Buffer *b, int cap, int elem_size) {
     b->cap = cap;
     b->in = b->out = 0;
@@ -75,6 +87,11 @@ static void buf_init(Buffer *b, int cap, int elem_size) {
     CHECK_SYS(sem_init(&b->mutex, 0, 1) == 0, "sem_init mutex failed");
 }
 
+/*
+ * buf_destroy - Free buffer resources and destroy semaphores.
+ * Args: b - buffer to destroy
+ * Return: void
+ */
 static void buf_destroy(Buffer *b) {
     sem_destroy(&b->empty);
     sem_destroy(&b->full);
@@ -82,6 +99,11 @@ static void buf_destroy(Buffer *b) {
     free(b->arr);
 }
 
+/*
+ * buf_put - Insert one element into the bounded buffer (blocks if full).
+ * Args: b - target buffer, item - pointer to element, elem_size - byte size
+ * Return: void
+ */
 static void buf_put(Buffer *b, void *item, int elem_size) {
     SEM_WAIT(&b->empty);
     SEM_WAIT(&b->mutex);
@@ -91,6 +113,11 @@ static void buf_put(Buffer *b, void *item, int elem_size) {
     SEM_POST(&b->full);
 }
 
+/*
+ * buf_get - Remove one element from the bounded buffer (blocks if empty).
+ * Args: b - source buffer, item - destination pointer, elem_size - byte size
+ * Return: void
+ */
 static void buf_get(Buffer *b, void *item, int elem_size) {
     SEM_WAIT(&b->full);
     SEM_WAIT(&b->mutex);
@@ -100,6 +127,11 @@ static void buf_get(Buffer *b, void *item, int elem_size) {
     SEM_POST(&b->empty);
 }
 
+/*
+ * token_pool_init - Initialise the token pool with given counts per type.
+ * Args: tp - pool to init, types - number of token types, init_cnt - initial count array
+ * Return: void
+ */
 static void token_pool_init(TokenPool *tp, int types, const int *init_cnt) {
     tp->T = types;
     tp->available = malloc(types * sizeof(int));
@@ -109,12 +141,23 @@ static void token_pool_init(TokenPool *tp, int types, const int *init_cnt) {
     CHECK(pthread_cond_init(&tp->cv, NULL) == 0, "pthread_cond_init failed");
 }
 
+/*
+ * token_pool_destroy - Free token pool resources.
+ * Args: tp - pool to destroy
+ * Return: void
+ */
 static void token_pool_destroy(TokenPool *tp) {
     pthread_mutex_destroy(&tp->mtx);
     pthread_cond_destroy(&tp->cv);
     free(tp->available);
 }
 
+/*
+ * acquire_tokens - Atomically acquire two token types; blocks if either is unavailable.
+ *                  Prevents deadlock by holding neither token until both are available.
+ * Args: tp - token pool, a - first token type index, b - second token type index
+ * Return: void
+ */
 static void acquire_tokens(TokenPool *tp, int a, int b) {
     pthread_mutex_lock(&tp->mtx);
     while (tp->available[a] <= 0 || tp->available[b] <= 0) {
@@ -125,6 +168,11 @@ static void acquire_tokens(TokenPool *tp, int a, int b) {
     pthread_mutex_unlock(&tp->mtx);
 }
 
+/*
+ * release_tokens - Return two token types to the pool and wake blocked encoders.
+ * Args: tp - token pool, a - first token type index, b - second token type index
+ * Return: void
+ */
 static void release_tokens(TokenPool *tp, int a, int b) {
     pthread_mutex_lock(&tp->mtx);
     tp->available[a]++;
@@ -133,6 +181,11 @@ static void release_tokens(TokenPool *tp, int a, int b) {
     pthread_mutex_unlock(&tp->mtx);
 }
 
+/*
+ * quantizer_thread - Thread function for quantizer; creates RawPackets and places them into Buffer A.
+ * Args: arg - unused
+ * Return: NULL
+ */
 void *quantizer_thread(void *arg) {
     (void)arg;
     while (1) {
@@ -145,12 +198,19 @@ void *quantizer_thread(void *arg) {
         next_order_id++;
         pthread_mutex_unlock(&next_order_mtx);
 
+        simulate_work(OP_Q1_QUANTIZE);
         RawPacket p = {oid, oid + 1, oid % T, 0};
         buf_put(&bufferA, &p, sizeof(RawPacket));
     }
     return NULL;
 }
 
+/*
+ * encoder_thread - Thread function for encoder; retrieves packets from Buffer A,
+ *                  acquires two tokens, computes encoded value, and places result into Buffer B.
+ * Args: arg - pointer to encoder id (int)
+ * Return: NULL
+ */
 void *encoder_thread(void *arg) {
     int id = *(int *)arg;
     int a = tA[id], b = tB[id];
@@ -166,6 +226,7 @@ void *encoder_thread(void *arg) {
         }
 
         acquire_tokens(&pool, a, b);
+        simulate_work(OP_Q1_ENCODE);
         EncodedPacket ep = {rp.order_id, rp.raw_value * 2 + a + b, 0};
         release_tokens(&pool, a, b);
 
@@ -174,6 +235,11 @@ void *encoder_thread(void *arg) {
     return NULL;
 }
 
+/*
+ * logger_thread - Thread function for logger; reads encoded packets from Buffer B and prints them.
+ * Args: arg - unused
+ * Return: NULL
+ */
 void *logger_thread(void *arg) {
     (void)arg;
     int seen_sentinels = 0;
@@ -183,6 +249,7 @@ void *logger_thread(void *arg) {
         if (ep.is_sentinel) {
             seen_sentinels++;
         } else {
+            simulate_work(OP_Q1_LOG);
             printf("[Logger] order_id=%d encoded=%d\n", ep.order_id, ep.encoded_value);
             fflush(stdout);
         }
@@ -190,6 +257,11 @@ void *logger_thread(void *arg) {
     return NULL;
 }
 
+/*
+ * parse_config - Parse pipeline configuration from file or command-line arguments.
+ * Args: argc - argument count, argv - argument vector
+ * Return: void; populates global variables P, M, N, num_orders, T, token_init_cnt, tA, tB
+ */
 static void parse_config(int argc, char **argv) {
     if (argc == 2) {
         FILE *fp = fopen(argv[1], "r");
