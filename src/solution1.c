@@ -1,7 +1,7 @@
 /* Group: 49
    Members: CHAN Chun Hin (chchan2494, ID: 59285357)
             Yip Tung Yin  (tungyyip7,  ID: 58527052)
-            Lee Kwan Ho, Phelim (, ID: 59284834)    */
+            Lee Kwan Ho, Phelim (khplee3, ID: 59284834)    */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

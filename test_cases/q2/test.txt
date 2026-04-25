@@ -1,0 +1,6 @@
+3 1 1 5
+W 0 READ item_0042.dat
+W 1 READ item_0099.dat
+M 0 WRITE item_0042.dat
+S 0 WRITE item_0099.dat
+W 2 READ item_0099.dat

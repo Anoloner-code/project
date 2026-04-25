@@ -1,3 +1,7 @@
+/* Group: 49
+   Members: CHAN Chun Hin (chchan2494, ID: 59285357)
+            Yip Tung Yin  (tungyyip7,  ID: 58527052)
+            Lee Kwan Ho, Phelim (khplee3, ID: 59284834)    */
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -55,7 +59,16 @@ typedef struct {
 typedef struct {
     Role role;
     int id;
+} DispatchEntry;
+
+typedef struct {
+    Role role;
+    int id;
     OpList *ops;
+    pthread_mutex_t ready_mtx;
+    pthread_cond_t ready_cv;
+    int released_count;
+    int started_count;
 } ThreadCtx;
 
 static int g_num_workers = 0;
@@ -66,6 +79,7 @@ static int g_num_ops = 0;
 static OpList *g_worker_ops = NULL;
 static OpList *g_manager_ops = NULL;
 static OpList *g_supervisor_ops = NULL;
+static DispatchEntry *g_dispatch_order = NULL;
 
 static DirectoryRegistry g_registry;
 static DirectoryState g_directory;
@@ -288,6 +302,45 @@ static void destroy_role_op_arrays(void) {
     g_worker_ops = NULL;
     g_manager_ops = NULL;
     g_supervisor_ops = NULL;
+
+    free(g_dispatch_order);
+    g_dispatch_order = NULL;
+}
+
+/* thread_ctx_init - Initialise per-thread dispatch coordination primitives.
+ * Args: ctx - context to initialise
+ * Return: void */
+static void thread_ctx_init(ThreadCtx *ctx) {
+    ctx->released_count = 0;
+    ctx->started_count = 0;
+
+    if (pthread_mutex_init(&ctx->ready_mtx, NULL) != 0) {
+        die("pthread_mutex_init failed");
+    }
+    if (pthread_cond_init(&ctx->ready_cv, NULL) != 0) {
+        die("pthread_cond_init failed");
+    }
+}
+
+/* thread_ctx_destroy - Destroy per-thread dispatch coordination primitives.
+ * Args: ctx - context to destroy
+ * Return: void */
+static void thread_ctx_destroy(ThreadCtx *ctx) {
+    pthread_mutex_destroy(&ctx->ready_mtx);
+    pthread_cond_destroy(&ctx->ready_cv);
+}
+
+/* context_for_dispatch - Resolve a dispatch entry to its ThreadCtx.
+ * Args: contexts - array of all thread contexts, dispatch - operation owner
+ * Return: pointer to the matching ThreadCtx */
+static ThreadCtx *context_for_dispatch(ThreadCtx *contexts, const DispatchEntry *dispatch) {
+    if (dispatch->role == ROLE_WORKER) {
+        return &contexts[dispatch->id];
+    }
+    if (dispatch->role == ROLE_MANAGER) {
+        return &contexts[g_num_workers + dispatch->id];
+    }
+    return &contexts[g_num_workers + g_num_managers + dispatch->id];
 }
 
 /* parse_input - Read and parse the Q2 input file (thread counts + operation list).
@@ -311,6 +364,7 @@ static void parse_input(const char *path) {
 
     registry_init(&g_registry);
     init_role_op_arrays();
+    g_dispatch_order = xmalloc((size_t)g_num_ops * sizeof(DispatchEntry));
 
     for (int i = 0; i < g_num_ops; i++) {
         char role_ch = '\0';
@@ -345,6 +399,8 @@ static void parse_input(const char *path) {
                 die("worker can only READ");
             }
             op_list_push(&g_worker_ops[id], &op);
+            g_dispatch_order[i].role = ROLE_WORKER;
+            g_dispatch_order[i].id = id;
         } else if (role_ch == 'M') {
             if (id < 0 || id >= g_num_managers) {
                 fclose(fp);
@@ -355,6 +411,8 @@ static void parse_input(const char *path) {
                 die("manager can only WRITE");
             }
             op_list_push(&g_manager_ops[id], &op);
+            g_dispatch_order[i].role = ROLE_MANAGER;
+            g_dispatch_order[i].id = id;
         } else if (role_ch == 'S') {
             if (id < 0 || id >= g_num_supervisors) {
                 fclose(fp);
@@ -365,6 +423,8 @@ static void parse_input(const char *path) {
                 die("supervisor can only WRITE");
             }
             op_list_push(&g_supervisor_ops[id], &op);
+            g_dispatch_order[i].role = ROLE_SUPERVISOR;
+            g_dispatch_order[i].id = id;
         } else {
             fclose(fp);
             die("unknown role");
@@ -384,7 +444,7 @@ static void perform_worker_read(int worker_id, DirectoryEntry *entry) {
     unsigned int observed_size;
 
     pthread_mutex_lock(&g_directory.mtx);
-    while (g_directory.writer_active || g_directory.waiting_supervisors > 0 || g_directory.waiting_managers > 0) {
+    while (g_directory.writer_active || g_directory.waiting_supervisors > 0) {
         if (!waiting_message_printed && g_directory.waiting_supervisors > 0) {
             print_line("[Worker-%d] [worker blocked: supervisor pending] waiting...", worker_id);
             waiting_message_printed = 1;
@@ -503,6 +563,14 @@ static void *role_thread_main(void *arg) {
     ThreadCtx *ctx = (ThreadCtx *)arg;
 
     for (int i = 0; i < ctx->ops->size; i++) {
+        pthread_mutex_lock(&ctx->ready_mtx);
+        while (ctx->released_count <= i) {
+            pthread_cond_wait(&ctx->ready_cv, &ctx->ready_mtx);
+        }
+        ctx->started_count = i + 1;
+        pthread_cond_broadcast(&ctx->ready_cv);
+        pthread_mutex_unlock(&ctx->ready_mtx);
+
         Operation *op = &ctx->ops->data[i];
         DirectoryEntry *entry = registry_get_entry(&g_registry, op->entry_index);
 
@@ -536,6 +604,7 @@ int main(int argc, char **argv) {
         contexts[next_thread].role = ROLE_WORKER;
         contexts[next_thread].id = i;
         contexts[next_thread].ops = &g_worker_ops[i];
+        thread_ctx_init(&contexts[next_thread]);
         if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create worker failed");
         }
@@ -546,6 +615,7 @@ int main(int argc, char **argv) {
         contexts[next_thread].role = ROLE_MANAGER;
         contexts[next_thread].id = i;
         contexts[next_thread].ops = &g_manager_ops[i];
+        thread_ctx_init(&contexts[next_thread]);
         if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create manager failed");
         }
@@ -556,16 +626,30 @@ int main(int argc, char **argv) {
         contexts[next_thread].role = ROLE_SUPERVISOR;
         contexts[next_thread].id = i;
         contexts[next_thread].ops = &g_supervisor_ops[i];
+        thread_ctx_init(&contexts[next_thread]);
         if (pthread_create(&threads[next_thread], NULL, role_thread_main, &contexts[next_thread]) != 0) {
             die("pthread_create supervisor failed");
         }
         next_thread++;
     }
 
+    for (int i = 0; i < g_num_ops; i++) {
+        ThreadCtx *ctx = context_for_dispatch(contexts, &g_dispatch_order[i]);
+
+        pthread_mutex_lock(&ctx->ready_mtx);
+        ctx->released_count++;
+        pthread_cond_signal(&ctx->ready_cv);
+        while (ctx->started_count < ctx->released_count) {
+            pthread_cond_wait(&ctx->ready_cv, &ctx->ready_mtx);
+        }
+        pthread_mutex_unlock(&ctx->ready_mtx);
+    }
+
     for (int i = 0; i < total_threads; i++) {
         if (pthread_join(threads[i], NULL) != 0) {
             die("pthread_join failed");
         }
+        thread_ctx_destroy(&contexts[i]);
     }
 
     free(threads);
