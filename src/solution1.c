@@ -1,3 +1,7 @@
+/* Group: 49
+   Members: CHAN Chun Hin (chchan2494, ID: 59285357)
+            Yip Tung Yin  (tungyyip7,  ID: 58527052)
+            Lee Kwan Ho, Phelim (, ID: 59284834)    */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +42,7 @@
 #define SEM_POST(s) CHECK_SYS(sem_post(s) == 0, "sem_post failed")
 
 typedef struct {
-    int order_id, raw_value, token_type, is_sentinel;
+    int order_id, raw_value, is_sentinel;
 } RawPacket;
 
 typedef struct {
@@ -207,7 +211,7 @@ void *quantizer_thread(void *arg) {
         pthread_mutex_unlock(&next_order_mtx);
 
         simulate_work(OP_Q1_QUANTIZE);
-        RawPacket p = {oid, oid + 1, oid % T, NOT_SENTINEL};
+        RawPacket p = {oid, oid + 1, NOT_SENTINEL};
         buf_put(&bufferA, &p, sizeof(RawPacket));
     }
     return NULL;
@@ -367,7 +371,7 @@ static void shutdown_pipeline(void) {
 
     /* One sentinel per encoder so every encoder exits its loop */
     for (int i = 0; i < P; i++) {
-        RawPacket s = {-1, 0, -1, IS_SENTINEL};
+        RawPacket s = {-1, 0, IS_SENTINEL};
         buf_put(&bufferA, &s, sizeof(RawPacket));
     }
 

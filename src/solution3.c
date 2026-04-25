@@ -5,13 +5,12 @@
 
 #define JOB_ID_MAX 63
 #define BAR_WIDTH 40
-#define NUM_ALGORITHMS 6
+#define NUM_ALGORITHMS 5
 
 typedef struct {
     char id[JOB_ID_MAX + 1];
     int arrival;
     int burst;
-    int priority;
     int index;
 } Job;
 
@@ -226,6 +225,7 @@ static int compare_jobs_by_arrival(const void *lhs, const void *rhs) {
 static int parse_jobs(const char *path, Job **jobs_out) {
     FILE *fp = fopen(path, "r");
     Job *jobs = NULL;
+    char line[256];
     int size = 0;
     int cap = 0;
 
@@ -233,19 +233,24 @@ static int parse_jobs(const char *path, Job **jobs_out) {
         die("fopen failed");
     }
 
-    for (;;) {
+    while (fgets(line, sizeof(line), fp) != NULL) {
         Job job;
-        int scanned = fscanf(fp, " %63s %d %d %d", job.id, &job.arrival, &job.burst, &job.priority);
+        char legacy_priority[64];
+        char extra[64];
+        int scanned;
 
-        if (scanned == EOF) {
-            break;
+        if (line[0] == '\n' || line[0] == '\0') {
+            continue;
         }
-        if (scanned != 4) {
+
+        scanned = sscanf(line, " %63s %d %d %63s %63s",
+            job.id, &job.arrival, &job.burst, legacy_priority, extra);
+        if (scanned != 3 && scanned != 4) {
             fclose(fp);
             free(jobs);
             die("invalid job line");
         }
-        if (job.arrival < 0 || job.burst <= 0 || job.priority < 0) {
+        if (job.arrival < 0 || job.burst <= 0) {
             fclose(fp);
             free(jobs);
             die("job values out of range");
@@ -357,22 +362,6 @@ static int sjf_better(const SimJob *candidate, const SimJob *best) {
     return candidate->job.index < best->job.index;
 }
 
-/* priority_better - Comparator for Priority: prefer lower priority number, then SJF ties.
- * Args: candidate, best - SimJob pointers to compare
- * Return: 1 if candidate should preempt best, 0 otherwise */
-static int priority_better(const SimJob *candidate, const SimJob *best) {
-    if (candidate->job.priority != best->job.priority) {
-        return candidate->job.priority < best->job.priority;
-    }
-    if (candidate->remaining != best->remaining) {
-        return candidate->remaining < best->remaining;
-    }
-    if (candidate->job.arrival != best->job.arrival) {
-        return candidate->job.arrival < best->job.arrival;
-    }
-    return candidate->job.index < best->job.index;
-}
-
 /* next_arrival_time - Find the earliest arrival after current_time among incomplete jobs.
  * Args: sim_jobs - simulation array, count - job count, current_time - current clock
  * Return: next arrival time, or INT_MAX if none */
@@ -445,7 +434,7 @@ static ScheduleResult simulate_fcfs(const Job *jobs, int count, int total_burst)
     return result;
 }
 
-/* simulate_preemptive - Run a preemptive scheduling simulation (SJF or Priority).
+/* simulate_preemptive - Run a preemptive scheduling simulation using a selection comparator.
  * Args: jobs - job array, count - job count, total_burst - sum of burst times,
  *       label - algorithm name, better - comparator for job selection
  * Return: ScheduleResult with Gantt chart and metrics */
@@ -801,10 +790,9 @@ int main(int argc, char **argv) {
 
     results[0] = simulate_fcfs(jobs, count, total_burst);
     results[1] = simulate_preemptive(jobs, count, total_burst, "SJF (Preemptive)", sjf_better);
-    results[2] = simulate_preemptive(jobs, count, total_burst, "Priority (Preemptive)", priority_better);
-    results[3] = simulate_rr(jobs, count, total_burst, 3, "RR (q=3)");
-    results[4] = simulate_rr(jobs, count, total_burst, 6, "RR (q=6)");
-    results[5] = simulate_mlfq(jobs, count, total_burst);
+    results[2] = simulate_rr(jobs, count, total_burst, 3, "RR (q=3)");
+    results[3] = simulate_rr(jobs, count, total_burst, 6, "RR (q=6)");
+    results[4] = simulate_mlfq(jobs, count, total_burst);
 
     for (int i = 0; i < NUM_ALGORITHMS; i++) {
         print_schedule(&results[i], jobs, count);
